@@ -1,0 +1,24 @@
+alice balance is now $100
+bob balance is now $100
+carol balance is now $100
+created pool xxxxxxxx  "Flight Delay"
+full id: UUID
+policy xxxxxxxx bought for alice - coverage $200 if reported value >= 60
+full id: UUID
+policy xxxxxxxx bought for bob - coverage $200 if reported value >= 60
+full id: UUID
+policy xxxxxxxx bought for carol - coverage $200 if reported value >= 60
+full id: UUID
+id:              UUID
+name:            Flight Delay
+trigger:         delay minutes >= threshold
+reserve:         $30
+outstanding:     $600 (across active, unexpired policies)
+floor required:  $180 (30% of outstanding)
+headroom:        $-150
+policies:
+  - xxxxxxxx  alice  premium $10  coverage $200  threshold 60  [active]
+  - xxxxxxxx  bob  premium $10  coverage $200  threshold 60  [active]
+  - xxxxxxxx  carol  premium $10  coverage $200  threshold 60  [active]
+DENIED: claim denied: paying this out would drop the reserve below what the pool owes its other active policies
+alice: $90

@@ -1,0 +1,165 @@
+# insure - parametric mutual-aid insurance pools, backed by real wallet/
+# pay/require. Unlike the sibling LarzCrowd/LarzBounty projects, premiums
+# are NOT held in escrow pending a condition - they pool permanently the
+# moment they're paid, exactly like real insurance: you're paying for
+# coverage during the policy period, not making a refundable deposit. So
+# this project uses `pay` directly rather than the `escrow` package's
+# open/release/refund vocabulary - there's nothing to release or refund
+# back to a payer, only ever a payout to a claimant.
+#
+# The real novelty is the claim path. A single policyholder's own balance
+# check is what `pay` already gives you for free - the HARD part a
+# parametric insurer actually has is a pool-wide solvency floor: a claim
+# must never be allowed to push the shared reserve below some fraction of
+# every OTHER active policy's outstanding coverage, or the pool becomes
+# unable to honor its other obligations. That's a cross-cutting
+# aggregate check spanning every policy in the pool, computed fresh at
+# claim time, wrapped in a real `require` - not a per-wallet balance
+# check, which is the only thing `pay` enforces on its own.
+#
+#   import "insure" as insure
+#   let b = insure.load("board.json")
+#   insure.fund(b, "alice", 50.00)                          # demo-only faucet
+#   let pid = insure.create_pool(b, "Flight Delay", "delay minutes >= threshold", 0.3)
+#   let policy = insure.buy_policy(b, pid, "alice", 10.00, 200.00, 60, 86400)
+#   insure.file_claim(b, pid, policy["id"], 75)              # 75 >= 60 -> pays out
+#   insure.save(b, "board.json")
+
+import "vendor/json.lz" as json
+import "moneyx.lz" as moneyx
+import "vendor/uuid.lz" as uuid
+
+fn new_board() { return {"wallets": {}, "pools": {}} }
+
+fn load(path) {
+  if not file_exists(path) { return new_board() }
+  return json.parse(read_file(path))
+}
+
+fn save(board, path) { write_file(path, json.pretty(board)) }
+
+fn balance(board, name) { return board["wallets"].has(name) ? board["wallets"][name] : 0.0 }
+
+fn _set_balance(board, name, f) { board["wallets"][name] = f }
+
+# Demo-only faucet - see the sibling LarzBounty/LarzCrowd projects' own
+# README precedent for why this exists and isn't a real payment rail.
+fn fund(board, name, amount) { _set_balance(board, name, balance(board, name) + amount) }
+
+fn create_pool(board, name, trigger_description, reserve_floor_pct) {
+  let id = uuid.v4()
+  board["pools"][id] = {
+    "id": id, "name": name, "trigger_description": trigger_description,
+    "reserve_floor_pct": reserve_floor_pct, "reserve_balance": 0.0,
+    "policies": {}, "created_at": time()
+  }
+  return id
+}
+
+fn get_pool(board, id) { return board["pools"].has(id) ? board["pools"][id] : nil }
+
+fn list_pools(board) {
+  let out = []
+  for id in keys(board["pools"]) { out.push(board["pools"][id]) }
+  return out
+}
+
+fn get_policy(pool, id) { return pool["policies"].has(id) ? pool["policies"][id] : nil }
+
+# Sum of coverage_amount for every still-active, not-yet-expired policy
+# in the pool OTHER than `exclude_id` - "what the pool still owes
+# everyone else" is what the solvency floor in file_claim() below is
+# actually protecting.
+fn outstanding_coverage(pool, exclude_id) {
+  let sum = 0.0
+  for pid in keys(pool["policies"]) {
+    if pid == exclude_id { continue }
+    let p = pool["policies"][pid]
+    if p["status"] == "active" and time() < p["expiry"] { sum = sum + p["coverage_amount"] }
+  }
+  return sum
+}
+
+# The premium pools PERMANENTLY into the reserve the moment it's paid -
+# no holding wallet, no refund path. Real `pay`, so a holder who can't
+# cover the premium gets a clean, catchable failure and no policy is
+# created.
+fn buy_policy(board, pool_id, holder, premium, coverage_amount, threshold, duration_secs) {
+  let pool = get_pool(board, pool_id)
+  if pool == nil { return {"ok": false, "error": "no such pool"} }
+
+  wallet holder_w = moneyx.of(balance(board, holder))
+  wallet reserve_w = moneyx.of(pool["reserve_balance"])
+
+  try {
+    pay moneyx.of(premium) from holder_w to reserve_w
+  } catch e {
+    return {"ok": false, "error": e["message"]}
+  }
+
+  _set_balance(board, holder, moneyx.to_float(holder_w.balance))
+  pool["reserve_balance"] = moneyx.to_float(reserve_w.balance)
+
+  let id = uuid.v4()
+  pool["policies"][id] = {
+    "id": id, "holder": holder, "premium": premium, "coverage_amount": coverage_amount,
+    "threshold": threshold, "status": "active", "expiry": time() + duration_secs,
+    "created_at": time()
+  }
+  return {"ok": true, "id": id}
+}
+
+# Fires (pays out in full) the instant reported_value meets the policy's
+# threshold (>=) - this is a parametric policy, so there's no adjuster,
+# no partial payout, no dispute: the number either clears the bar or it
+# doesn't. What it CAN still refuse is the solvency check below, which
+# denies the claim outright rather than draining the pool below what it
+# owes everyone else.
+fn file_claim(board, pool_id, policy_id, reported_value) {
+  let pool = get_pool(board, pool_id)
+  if pool == nil { return {"ok": false, "error": "no such pool"} }
+  let policy = get_policy(pool, policy_id)
+  if policy == nil { return {"ok": false, "error": "no such policy"} }
+  if policy["status"] != "active" { return {"ok": false, "error": "policy is " + policy["status"] + ", not active"} }
+  if time() >= policy["expiry"] { return {"ok": false, "error": "policy has expired"} }
+  if reported_value < policy["threshold"] { return {"ok": false, "error": "reported value does not meet the trigger threshold"} }
+
+  let payout = policy["coverage_amount"]
+  let reserve_after = pool["reserve_balance"] - payout
+  let floor_requirement = outstanding_coverage(pool, policy_id) * pool["reserve_floor_pct"]
+
+  try {
+    require reserve_after >= floor_requirement, "payout would breach the pool's solvency floor"
+  } catch e {
+    return {"ok": false, "error": "claim denied: paying this out would drop the reserve below what the pool owes its other active policies", "denied_for_solvency": true}
+  }
+
+  wallet reserve_w = moneyx.of(pool["reserve_balance"])
+  wallet holder_w = moneyx.of(balance(board, policy["holder"]))
+  pay moneyx.of(payout) from reserve_w to holder_w
+
+  pool["reserve_balance"] = moneyx.to_float(reserve_w.balance)
+  _set_balance(board, policy["holder"], moneyx.to_float(holder_w.balance))
+  policy["status"] = "claimed"
+  policy["claimed_at"] = time()
+  return {"ok": true, "payout": payout}
+}
+
+# Policies past their expiry with no claim just lapse - the premium stays
+# in the pool (it already paid for coverage during the period that just
+# ended), it is never refunded. This is the deliberate opposite of
+# LarzCrowd's/LarzBounty's refund-on-miss behavior.
+fn sweep_expired(board) {
+  let swept = []
+  for pool_id in keys(board["pools"]) {
+    let pool = board["pools"][pool_id]
+    for pid in keys(pool["policies"]) {
+      let p = pool["policies"][pid]
+      if p["status"] == "active" and time() >= p["expiry"] {
+        p["status"] = "expired"
+        swept.push({"pool_id": pool_id, "policy_id": pid})
+      }
+    }
+  }
+  return swept
+}

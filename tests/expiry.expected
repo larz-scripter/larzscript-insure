@@ -1,0 +1,17 @@
+bob balance is now $100
+created pool xxxxxxxx  "Quick Expiry Test"
+full id: UUID
+policy xxxxxxxx bought for bob - coverage $20 if reported value >= 999999
+full id: UUID
+bob: $95
+expired: pool xxxxxxxx policy xxxxxxxx
+id:              UUID
+name:            Quick Expiry Test
+trigger:         n/a
+reserve:         $5
+outstanding:     $0 (across active, unexpired policies)
+floor required:  $0 (10% of outstanding)
+headroom:        $5
+policies:
+  - xxxxxxxx  bob  premium $5  coverage $20  threshold 999999  [expired]
+bob: $95

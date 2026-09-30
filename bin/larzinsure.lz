@@ -1,0 +1,161 @@
+#!/usr/bin/env larzscript
+# larzinsure - CLI for the parametric mutual-aid insurance pools in
+# lib/insure.lz.
+#
+#   larzinsure fund alice 100
+#   larzinsure create-pool "Flight Delay" "delay minutes >= threshold" 0.3
+#   larzinsure buy <pool_id> alice 10 200 60 --duration=86400
+#   larzinsure claim <pool_id> <policy_id> 75
+#   larzinsure sweep
+#   larzinsure show <pool_id>
+#
+# --board=path overrides the default ./board.json
+
+import "../lib/vendor/args.lz" as argparse
+import "../lib/vendor/table.lz" as table
+import "../lib/insure.lz" as insure
+
+let VERSION = "0.1.0"
+
+let USAGE = "larzinsure " + VERSION + " - parametric mutual-aid insurance, backed by real wallet/pay/require\n" +
+  "\n" +
+  "usage:\n" +
+  "  larzinsure fund <name> <amount>\n" +
+  "  larzinsure create-pool <name> <trigger_description> <reserve_floor_pct>\n" +
+  "  larzinsure buy <pool_id> <holder> <premium> <coverage> <threshold> --duration=<secs>\n" +
+  "  larzinsure claim <pool_id> <policy_id> <reported_value>\n" +
+  "  larzinsure sweep\n" +
+  "  larzinsure list\n" +
+  "  larzinsure show <pool_id>\n" +
+  "  larzinsure balance <name>\n" +
+  "\n" +
+  "options:\n" +
+  "  --board=<path>   board file to read/write (default: ./board.json)\n"
+
+fn fail(msg) { print("error: " + msg); exit(1) }
+fn short(id) { return id[0:8] }
+
+fn _find_pool_by_prefix(board, prefix) {
+  if len(prefix) < 4 { return nil }
+  for id in keys(board["pools"]) {
+    if id.starts_with(prefix) { return id }
+  }
+  return nil
+}
+
+fn _find_policy_by_prefix(pool, prefix) {
+  if len(prefix) < 4 { return nil }
+  for id in keys(pool["policies"]) {
+    if id.starts_with(prefix) { return id }
+  }
+  return nil
+}
+
+fn cmd_fund(board, positional) {
+  if len(positional) < 2 { fail("fund needs <name> <amount>") }
+  let name = positional[0]
+  let amount = float(positional[1])
+  insure.fund(board, name, amount)
+  print(name + " balance is now $" + str(insure.balance(board, name)))
+}
+
+fn cmd_create_pool(board, positional) {
+  if len(positional) < 3 { fail("create-pool needs <name> <trigger_description> <reserve_floor_pct>") }
+  let id = insure.create_pool(board, positional[0], positional[1], float(positional[2]))
+  print("created pool " + short(id) + "  \"" + positional[0] + "\"")
+  print("full id: " + id)
+}
+
+fn cmd_buy(board, positional, parsed) {
+  if len(positional) < 5 { fail("buy needs <pool_id> <holder> <premium> <coverage> <threshold>") }
+  let pool_id = _find_pool_by_prefix(board, positional[0])
+  if pool_id == nil { fail("no pool matching id " + positional[0]) }
+  let duration_flag = argparse.flag(parsed, "duration")
+  if duration_flag == nil { fail("buy needs --duration=<secs>") }
+  let r = insure.buy_policy(board, pool_id, positional[1], float(positional[2]), float(positional[3]), float(positional[4]), float(duration_flag))
+  if not r["ok"] { fail(r["error"]) }
+  print("policy " + short(r["id"]) + " bought for " + positional[1] + " - coverage $" + positional[3] + " if reported value >= " + positional[4])
+  print("full id: " + r["id"])
+}
+
+fn cmd_claim(board, positional) {
+  if len(positional) < 3 { fail("claim needs <pool_id> <policy_id> <reported_value>") }
+  let pool_id = _find_pool_by_prefix(board, positional[0])
+  if pool_id == nil { fail("no pool matching id " + positional[0]) }
+  let pool = insure.get_pool(board, pool_id)
+  let policy_id = _find_policy_by_prefix(pool, positional[1])
+  if policy_id == nil { fail("no policy matching id " + positional[1]) }
+  let r = insure.file_claim(board, pool_id, policy_id, float(positional[2]))
+  if not r["ok"] {
+    print((r.has("denied_for_solvency") ? "DENIED: " : "rejected: ") + r["error"])
+    return
+  }
+  print("CLAIM PAID: $" + str(r["payout"]))
+}
+
+fn cmd_sweep(board) {
+  let swept = insure.sweep_expired(board)
+  if len(swept) == 0 { print("nothing to sweep"); return }
+  for s in swept { print("expired: pool " + short(s["pool_id"]) + " policy " + short(s["policy_id"])) }
+}
+
+fn cmd_list(board) {
+  let pools = insure.list_pools(board)
+  if len(pools) == 0 { print("no pools"); return }
+  let rows = [["id", "name", "reserve", "floor %", "policies"]]
+  for p in pools {
+    rows.push([short(p["id"]), p["name"], "$" + str(p["reserve_balance"]), str(p["reserve_floor_pct"] * 100) + "%", str(len(p["policies"]))])
+  }
+  print(table.render(rows))
+}
+
+fn cmd_show(board, positional) {
+  if len(positional) < 1 { fail("show needs <pool_id>") }
+  let pool_id = _find_pool_by_prefix(board, positional[0])
+  if pool_id == nil { fail("no pool matching id " + positional[0]) }
+  let p = insure.get_pool(board, pool_id)
+  let outstanding = insure.outstanding_coverage(p, "")
+  let floor_req = outstanding * p["reserve_floor_pct"]
+  print("id:              " + p["id"])
+  print("name:            " + p["name"])
+  print("trigger:         " + p["trigger_description"])
+  print("reserve:         $" + str(p["reserve_balance"]))
+  print("outstanding:     $" + str(outstanding) + " (across active, unexpired policies)")
+  print("floor required:  $" + str(floor_req) + " (" + str(p["reserve_floor_pct"] * 100) + "% of outstanding)")
+  print("headroom:        $" + str(p["reserve_balance"] - floor_req))
+  print("policies:")
+  for pid in keys(p["policies"]) {
+    let pol = p["policies"][pid]
+    print("  - " + short(pid) + "  " + pol["holder"] + "  premium $" + str(pol["premium"]) + "  coverage $" + str(pol["coverage_amount"]) + "  threshold " + str(pol["threshold"]) + "  [" + pol["status"] + "]")
+  }
+}
+
+fn cmd_balance(board, positional) {
+  if len(positional) < 1 { fail("balance needs <name>") }
+  print(positional[0] + ": $" + str(insure.balance(board, positional[0])))
+}
+
+fn main() {
+  let parsed = argparse.parse(args)
+  let positional = parsed["positional"]
+  if len(positional) < 1 { print(USAGE); exit(1) }
+  let command = positional[0]
+  let rest = positional[1:]
+  let board_path = argparse.flag(parsed, "board", "board.json")
+  let board = insure.load(board_path)
+
+  if command == "fund" { cmd_fund(board, rest) }
+  else if command == "create-pool" { cmd_create_pool(board, rest) }
+  else if command == "buy" { cmd_buy(board, rest, parsed) }
+  else if command == "claim" { cmd_claim(board, rest) }
+  else if command == "sweep" { cmd_sweep(board) }
+  else if command == "list" { cmd_list(board) }
+  else if command == "show" { cmd_show(board, rest) }
+  else if command == "balance" { cmd_balance(board, rest) }
+  else if command == "help" or command == "--help" or command == "-h" { print(USAGE); exit(0) }
+  else { fail("unknown command \"" + command + "\" - see: larzinsure help") }
+
+  insure.save(board, board_path)
+}
+
+main()
